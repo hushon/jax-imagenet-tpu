@@ -45,7 +45,6 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-
 def tprint(obj):
     tqdm.write(obj.__str__())
 
@@ -63,11 +62,10 @@ def softmax_cross_entropy(logits, labels):
 
 
 def correct_topk(logits, labels, k):
-    logits = np.asarray(logits)
-    labels = np.asarray(labels)[..., None]
-    preds = np.argpartition(logits, -k, axis=-1)[..., -k:]
-    # labels = np.broadcast_to(labels, preds.shape)
-    return np.any(preds == labels, axis=-1)
+    logits = jnp.asarray(logits)
+    labels = jnp.asarray(labels)[..., None]
+    preds = jnp.argsort(logits, axis=-1)[..., -k:]
+    return jnp.any(preds == labels, axis=-1)
 
 
 def weight_penalty(params):
@@ -79,13 +77,6 @@ def weight_penalty(params):
 def forward(images, is_training: bool):
     net = hk.nets.ResNet18(num_classes=1000)
     return net(images, is_training=is_training)
-
-
-@jax.jit
-def ema_update(params, params_avg):
-    '''polyak averaging'''
-    params_avg = optax.incremental_update(params, params_avg, step_size=0.001)
-    return params_avg
 
 
 def main():
@@ -103,11 +94,6 @@ def main():
         div_factor=25.0,
         final_div_factor=1e4
     )
-    # learning_rate_fn = optax.cosine_decay_schedule(
-    #     init_value=FLAGS.INIT_LR,
-    #     decay_steps=FLAGS.MAX_STEP,
-    #     alpha=0.0
-    #     )
     optimizer = optax.sgd(learning_rate_fn, momentum=0.9, nesterov=False)
 
 
@@ -123,7 +109,7 @@ def main():
     n_devices = len(jax.local_devices())
 
 
-    @functools.partial(jax.pmap, axis_name='i', donate_argnums=(0,))
+    @functools.partial(jax.pmap, axis_name='device', donate_argnums=(0,))
     def train_step(train_state: TrainState, batch: dict):
         params, state, opt_state = train_state
         input, target = batch['images'], batch['labels']
@@ -137,15 +123,48 @@ def main():
             }
             return loss, aux
         grads, aux = jax.grad(loss_fn, has_aux=True)(params)
-        grads = jax.lax.pmean(grads, axis_name='i')
+        grads = jax.lax.pmean(grads, axis_name='device')
         delta, opt_state = optimizer.update(grads, opt_state)
         params = optax.apply_updates(params, delta)
-        train_state = TrainState(params, aux['state'], opt_state)
-        aux = {
+        summary = {
             'loss': aux['loss'],
-            'correct': jnp.argmax(aux['logits'], -1) == target,
+            # 'correct': correct_topk(aux['logits'], target, k=1),
         }
-        return train_state, aux
+        return TrainState(params, aux['state'], opt_state), summary
+
+
+    @functools.partial(jax.pmap, axis_name='j', donate_argnums=(0,))
+    def eval_step(train_state: TrainState, batch: dict):
+        params, state, _ = train_state
+        input, target = batch['images'], batch['labels']
+        logits, _ = model.apply(params, state, input, is_training=False)
+        summary = {
+            "loss": softmax_cross_entropy(logits, target),
+            "correct_top1": correct_topk(logits, target, k=1),
+            "correct_top5": correct_topk(logits, target, k=5)
+        }
+        return summary
+
+
+    def evaluate(train_state, data_loader):
+        corrects_t1 = []
+        corrects_t5 = []
+        losses = []
+        for batch in data_loader:
+            batch = {
+                'images': jnp.asarray(einops.rearrange(batch['images'], '(n b) h w c -> n b h w c', n=n_devices)),
+                'labels': jnp.asarray(einops.rearrange(batch['labels'], '(n b) -> n b', n=n_devices)),
+            }
+            summary = eval_step(train_state, batch)
+            corrects_t1.append(summary['correct_top1'].flatten())
+            corrects_t5.append(summary['correct_top5'].flatten())
+            losses.append(summary['loss'].flatten())
+        summary = {
+            "loss": np.mean(losses).item(),
+            "acc_t1": np.mean(corrects_t1).item()*100,
+            "acc_t5": np.mean(corrects_t5).item()*100,
+        }
+        return summary
 
 
     def save_pickle(filename='model.pickle'):
@@ -154,11 +173,14 @@ def main():
         np.save(pickle_path, state_dict)
         print(f'[SAVE] {pickle_path}')
 
+
     if FLAGS.SAVE:
         atexit.register(save_pickle)
 
+
     train_loader = iter(train_dataset)
     losses = []
+    corrects = []
 
     for iter_idx in (pbar := trange(FLAGS.MAX_STEP)):
         batch = next(train_loader)
@@ -167,16 +189,20 @@ def main():
             'labels': jnp.asarray(einops.rearrange(batch['labels'], '(n b) -> n b', n=n_devices)),
         }
         train_state, aux = train_step(train_state, batch)
-        losses.append(aux['loss'].flatten())
+        # losses.append(aux['loss'].flatten())
+        # corrects.append(aux['correct'].flatten())
 
         if iter_idx > 0:
             pbar.set_description(f"{FLAGS.BATCH_SIZE*pbar.format_dict['rate']:.1f} samples/sec")
 
         if iter_idx % 100 == 0:
-            loss = np.mean(losses).item()
+            # loss = np.mean(losses).item()
+            # acc = np.mean(corrects).item()*100
             losses.clear()
-            last_lr = learning_rate_fn(train_state.opt_state[-1].count).item()
-            tqdm.write(f'[{iter_idx}/{len(pbar)}] LR: {last_lr:.3f} | [Train] Loss {loss:.3f}')
+            corrects.clear()
+            last_lr = learning_rate_fn(train_state.opt_state[-1].count[0]).item()
+            tprint(f'[{iter_idx}/{len(pbar)}] LR: {last_lr:.3f}')
+            # tprint(f'[{iter_idx}/{len(pbar)}] LR: {last_lr:.3f} | [Train] Loss {loss:.3f} AccT1 {acc:.2f}')
 
 
 if __name__ == '__main__':
