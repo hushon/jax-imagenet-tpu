@@ -70,7 +70,7 @@ def correct_topk(logits, labels, k):
     return np.any(preds == labels, axis=-1)
 
 
-def l2_loss(params):
+def weight_penalty(params):
     l2_params = [p for (mod_name, _), p in tree.flatten_with_path(
         params) if 'batchnorm' not in mod_name]
     return 0.5 * sum(jnp.sum(jnp.square(p)) for p in l2_params)
@@ -89,30 +89,7 @@ def ema_update(params, params_avg):
 
 
 def main():
-
-    """
-    normalize = utils.ArrayNormalize(IMAGENET_MEAN, IMAGENET_STD)
-    # transform_train = transforms.Compose([
-    #     transforms.RandomResizedCrop(224),
-    #     transforms.RandomHorizontalFlip(),
-    #     transforms.Lambda(utils.pil_to_tensor),
-    # ])
-    # transform_test = transforms.Compose([
-    #     transforms.Resize(256),
-    #     transforms.CenterCrop(224),
-    #     transforms.Lambda(utils.pil_to_tensor),
-    # ])
-    transform_train_a = A.Compose([
-        A.RandomResizedCrop(224, 224),
-        A.HorizontalFlip(),
-    ])
-    transform_test_a = A.Compose([
-        A.Resize(256, 256),
-        A.CenterCrop(224, 224),
-    ])
-    """
-
-
+    ## DATASET ##
     train_dataset = dataset.load(True, FLAGS.BATCH_SIZE, jnp.float32)
 
     ## MODEL TRANSFORM ##
@@ -150,13 +127,9 @@ def main():
     def train_step(train_state: TrainState, batch: dict):
         params, state, opt_state = train_state
         input, target = batch['images'], batch['labels']
-        # input = input.astype(jnp.float32) / 255.0
-        # mean = jnp.array(IMAGENET_MEAN).reshape(1, 1, 1, -1)
-        # std = jnp.array(IMAGENET_STD).reshape(1, 1, 1, -1)
-        # input = (input - mean) / std
         def loss_fn(p):
             logits, state_new = model.apply(p, state, input, is_training=True)
-            loss = softmax_cross_entropy(logits, target).mean() + l2_loss(p)*FLAGS.WEIGHT_DECAY
+            loss = softmax_cross_entropy(logits, target).mean() + weight_penalty(p)*FLAGS.WEIGHT_DECAY
             aux = {
                 'state': state_new,
                 'loss': loss,
@@ -170,7 +143,7 @@ def main():
         train_state = TrainState(params, aux['state'], opt_state)
         aux = {
             'loss': aux['loss'],
-            'correct': None,
+            'correct': jnp.argmax(aux['logits'], -1) == target,
         }
         return train_state, aux
 
@@ -187,26 +160,23 @@ def main():
     train_loader = iter(train_dataset)
     losses = []
 
-    progress_bar = trange(FLAGS.MAX_STEP)
-    for iter_idx in progress_bar:
+    for iter_idx in (pbar := trange(FLAGS.MAX_STEP)):
         batch = next(train_loader)
         batch = {
             'images': jnp.asarray(einops.rearrange(batch['images'], '(n b) h w c -> n b h w c', n=n_devices)),
             'labels': jnp.asarray(einops.rearrange(batch['labels'], '(n b) -> n b', n=n_devices)),
         }
-        # breakpoint()
-
         train_state, aux = train_step(train_state, batch)
-        # losses.append(aux['loss'].flatten())
+        losses.append(aux['loss'].flatten())
 
         if iter_idx > 0:
-            progress_bar.set_description(f"{FLAGS.BATCH_SIZE*progress_bar.format_dict['rate']:.1f} samples/sec")
+            pbar.set_description(f"{FLAGS.BATCH_SIZE*pbar.format_dict['rate']:.1f} samples/sec")
 
-        # if iter_idx % 5000 == 0:
-        #     loss = np.mean(losses).item()
-        #     losses.clear()
-        #     last_lr = learning_rate_fn(jax.tree_map(lambda x: x[0], train_state).opt_state[-1].count).item()
-        #     print(f'[{iter_idx}/{len(progress_bar)-1}] LR: {last_lr:.3f} | [Train] Loss {loss:.3f}')
+        if iter_idx % 100 == 0:
+            loss = np.mean(losses).item()
+            losses.clear()
+            last_lr = learning_rate_fn(train_state.opt_state[-1].count).item()
+            tqdm.write(f'[{iter_idx}/{len(pbar)}] LR: {last_lr:.3f} | [Train] Loss {loss:.3f}')
 
 
 if __name__ == '__main__':
